@@ -10,6 +10,10 @@ class ZCL_BSM_UTIL definition
 
 public section.
 
+  types HIER_NR_TT type STANDARD TABLE OF zmdm_pchier_nr with DEFAULT KEY.
+  types:
+*    hiernode_TT type HASHED TABLE OF BAPISET_HIER WITH UNIQUE KEY groupname .
+    hiernode_TT TYPE STANDARD TABLE OF bapiset_hier WITH KEY groupname .
   types:
     BEGIN OF number_t,
       number TYPE char12 ,
@@ -19,10 +23,15 @@ public section.
   types:
     BEGIN OF number_req_t,
 *      bukrs TYPE bukrs,
-      code type char10,
+      code type char15, " extended from char10 to make room for hierarchy node ids
       type TYPE nrsobj,
       END OF number_req_t .
 
+*  types:
+*    BEGIN OF numberh_req_t,
+*      hnode type grpname,
+*      type TYPE nrsobj,
+*      END OF numberh_req_t .
   methods CONSTRUCTOR
     importing
       !I_JSON type STRING .
@@ -64,8 +73,19 @@ private section.
 
   data SUBOBJ type ref to OBJECT .
   data IMPORT_JSON type STRING .
+  data HIERARCHYNODES type HIERNODE_TT .
 
   methods GET_NEXT_NUMBER_INST
+    importing
+      !I_NUMBER_REQ type NUMBER_REQ_T
+    returning
+      value(R_NUMBER) type NUMBER_T .
+  methods GET_NEXT_NUMBER_H_INST
+    importing
+      !I_NUMBER_REQ type NUMBER_REQ_T
+    returning
+      value(R_NUMBER) type NUMBER_T .
+  methods GET_NEXT_NUM
     importing
       !I_NUMBER_REQ type NUMBER_REQ_T
     returning
@@ -161,6 +181,108 @@ ENDMETHOD.
 
 
 * <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_BSM_UTIL->GET_NEXT_NUM
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] I_NUMBER_REQ                   TYPE        NUMBER_REQ_T
+* | [<-()] R_NUMBER                       TYPE        NUMBER_T
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+METHOD GET_NEXT_NUM.
+*DATA LANGUAGE            TYPE BAPI0015_10.
+*DATA RETURN              TYPE BAPIRET2.
+  DATA: found_range TYPE boole_d,
+        lt_hiernodes_all TYPE STANDARD TABLE OF bapiset_hier WITH KEY groupname,
+        lt_hiernodes_sel TYPE STANDARD TABLE OF bapiset_hier WITH DEFAULT KEY,
+        grpname TYPE grpname,
+        lt_hier_nr TYPE STANDARD TABLE OF zmdm_pchier_nr,
+        nrnr TYPE nrnr,
+        readidx TYPE i,
+        sub TYPE REF TO lif_sub.
+
+  FIELD-SYMBOLS: <current_node> TYPE bapiset_hier,
+                 <next_node> TYPE bapiset_hier,
+                 <parent_node> TYPE bapiset_hier,
+                 <hier_nr> TYPE zmdm_pchier_nr.
+
+  sub ?= me->subobj. "local object for subroutines, NOT subobj to number range object!
+
+  IF me->hierarchynodes IS INITIAL.
+*  Get the whole Comp standard hierarchy
+    CASE i_number_req-type.
+      WHEN 'PC'.
+        lt_hiernodes_all = sub->get_pchier( ).
+      WHEN 'CC'.
+        lt_hiernodes_all = sub->get_cchier( ).
+    ENDCASE.
+  ENDIF.
+
+* Let's build a table with all the parent levels from request node up to the root
+* Example structure (lt_hiernodes_all) from the BAPI:
+*   GROUPNAME       HIERLEVEL     VALCOUNT  DESCR
+*    A9000                   0          0  Comp Oy
+*    C4000                   1          0  Comp Services BG
+*    E4000                   2          0  PS Mail Srvcs BU
+*    K400000                 3          0  PS Mail International Co-op
+*    Y4000000                4          1  PS Mail International Co-op
+*    K400020                 3          0  PS Mail Consumers
+*    Y4000020                4          3  PS Mail Consumers
+*    K400030                 3          0  PS Mail Corporations
+*    P400030                 4          0  PS Mail Corp. Letter Int. srvcs
+*    Y4000030                5          1  PS Mail Corp Letter Int srvcs
+*    P400035                 4          0  PS Mail Corp. Letter Dom. srvcs
+*    Y4000035                5          3  PS Mail Corp Letter Dom srvcs
+*
+* Example request node: Y4000035
+
+* Find starting node = node in request
+  READ TABLE lt_hiernodes_all WITH TABLE KEY groupname = i_number_req-code
+    ASSIGNING <next_node>.
+  IF sy-subrc <> 0.
+    RETURN. "throw exception?
+  ENDIF.
+  readidx = sy-tabix.
+  ASSIGN <next_node> to <current_node>.
+  WHILE <next_node>-hierlevel >= 0 AND readidx > 0.
+*    We haven't reached top of lt_hiernodes_all yet. Move one level up.
+    readidx = readidx - 1.
+    READ TABLE lt_hiernodes_all INDEX readidx  ASSIGNING <next_node>.
+    IF sy-subrc <> 0.
+      EXIT.
+    ENDIF.
+    IF <next_node>-hierlevel < <current_node>-hierlevel.
+* We found the direct parent, e.g. P400035 is parent of Y4000035
+      APPEND <current_node> TO lt_hiernodes_sel.
+      ASSIGN <next_node> TO <current_node>.
+    ELSE.
+* We found a node of same level (e.g. Y4000030) or parent to another node (e.g. P400030). Move on.
+    ENDIF.
+  ENDWHILE.
+  SORT lt_hiernodes_sel BY hierlevel DESCENDING.
+
+*  Get all the assignments of number range to hierarchy
+  lt_hier_nr = sub->get_hier_nr( i_number_req-type ).
+
+*  First, we'll see if there's a nrrange attached directly to the given hierarchy level.
+*  If not, we'll try with the parent of the hierarchy level and so on...
+  found_range = abap_false.
+  grpname = i_number_req-code.
+
+  LOOP AT lt_hiernodes_sel ASSIGNING <current_node> .
+    READ TABLE lt_hier_nr ASSIGNING <hier_nr> WITH KEY grpname = <current_node>-groupname.
+    IF sy-subrc = 0.
+      found_range = abap_true.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+  IF found_range = abap_false.
+    RETURN.
+*    Throw exception?
+  ENDIF.
+  r_number = sub->number_get_next( i_nrnr = <hier_nr>-nrrangenr i_subobj = i_number_req-type ).
+
+ENDMETHOD.
+
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
 * | Static Public Method ZCL_BSM_UTIL=>GET_NEXT_NUMBER
 * +-------------------------------------------------------------------------------------------------+
 * | [--->] I_DATA                         TYPE        STRING
@@ -200,6 +322,7 @@ ENDMETHOD.
 * | [<-()] R_DATA                         TYPE        STRING
 * +--------------------------------------------------------------------------------------</SIGNATURE>
 METHOD GET_NEXT_NUMBER_H.
+* Get a PC or CC hierarchy node. Return the next number from the corresponding interval.
   DATA: this TYPE REF TO zcl_bsm_util,
         sub TYPE REF TO lif_sub,
         number_req TYPE number_req_t,
@@ -214,9 +337,7 @@ METHOD GET_NEXT_NUMBER_H.
     CHANGING
         e_data = number_req ).
 
-* Test code
-  number-number = '00000001'.
-*  number = this->get_next_number_inst( number_req ).
+  number = this->get_next_number_h_inst( number_req ).
 
 *  Put number to json
   data_to_json(
@@ -224,6 +345,35 @@ METHOD GET_NEXT_NUMBER_H.
       i_data = number
     CHANGING
       e_json = r_data ).
+
+ENDMETHOD.
+
+
+* <SIGNATURE>---------------------------------------------------------------------------------------+
+* | Instance Private Method ZCL_BSM_UTIL->GET_NEXT_NUMBER_H_INST
+* +-------------------------------------------------------------------------------------------------+
+* | [--->] I_NUMBER_REQ                   TYPE        NUMBER_REQ_T
+* | [<-()] R_NUMBER                       TYPE        NUMBER_T
+* +--------------------------------------------------------------------------------------</SIGNATURE>
+METHOD GET_NEXT_NUMBER_H_INST.
+  DATA: sub TYPE REF TO lif_sub,
+        found_nr type boole_d,
+        sobj type NRSOBJ.
+
+  FIELD-SYMBOLS: <ret> TYPE bapiret2.
+  sub ?= me->subobj.
+  sobj = i_number_req-type.
+  found_nr = abap_false.
+  WHILE found_nr = abap_false.
+*    r_number = sub->get_nr( i_num_req = i_number_req i_use_h = abap_true ).
+    r_number = me->get_next_num( i_number_req = i_number_req ).
+    IF r_number-rc <> 0.
+      EXIT.
+    ENDIF.
+    IF sub->nr_free( i_number = r_number-number i_subobj = sobj i_use_h = abap_true ) = abap_true.
+      found_nr = abap_true.
+    ENDIF.
+  ENDWHILE.
 
 ENDMETHOD.
 
